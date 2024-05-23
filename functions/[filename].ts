@@ -1,4 +1,13 @@
-import { GetObjectCommand, CopyObjectCommand, DeleteObjectCommand, GetObjectCommandOutput } from "@aws-sdk/client-s3";
+import {
+    GetObjectCommand,
+    CopyObjectCommand,
+    DeleteObjectCommand,
+    GetObjectCommandOutput,
+    CreateMultipartUploadCommand,
+    UploadPartCommand,
+    CompleteMultipartUploadCommand,
+    AbortMultipartUploadCommand
+} from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import mime from 'mime/lite';
@@ -64,16 +73,60 @@ export const onRequestPut: PagesFunction<Env> = async (context) => {
             x_store_headers.push([key, value]);
         }
     }
-    const parallelUploads3 = new Upload({
-        client: s3,
-        params: { Bucket: BUCKET, Key: filename as string, Body: request.body, Metadata: Object.fromEntries(x_store_headers) },
-        queueSize: 4, // optional concurrency configuration
-        partSize: 1024 * 1024 * 5, // optional size of each part, in bytes, at least 5MB
-        leavePartsOnError: false, // optional manually handle dropped parts
+
+    const contentType = headers.get('content-type') || mime.getType(filename as string) || "application/octet-stream";
+
+    // Step 1: Create multipart upload
+    const createMultipartUploadCommand = new CreateMultipartUploadCommand({
+        Bucket: BUCKET!,
+        Key: filename as string,
+        ContentType: contentType,
+        Metadata: Object.fromEntries(x_store_headers)
     });
-    await parallelUploads3.done();
-    return new Response("OK", { status: 200 });
-}
+    const multipartUpload = await s3.send(createMultipartUploadCommand);
+    const uploadId = multipartUpload.UploadId;
+
+    try {
+        // Step 2: Upload parts
+        const partSize = 1024 * 1024 * 5; // 5MB
+        const parts = [];
+        let partNumber = 1;
+        const reader = request.body.getReader();
+        let chunk;
+        while (!(chunk = await reader.read()).done) {
+            const uploadPartCommand = new UploadPartCommand({
+                Bucket: BUCKET!,
+                Key: filename as string,
+                PartNumber: partNumber,
+                UploadId: uploadId,
+                Body: new Uint8Array(chunk.value)
+            });
+            const part = await s3.send(uploadPartCommand);
+            parts.push({ PartNumber: partNumber, ETag: part.ETag });
+            partNumber++;
+        }
+
+        // Step 3: Complete multipart upload
+        const completeMultipartUploadCommand = new CompleteMultipartUploadCommand({
+            Bucket: BUCKET!,
+            Key: filename as string,
+            UploadId: uploadId,
+            MultipartUpload: { Parts: parts }
+        });
+        await s3.send(completeMultipartUploadCommand);
+
+        return new Response("OK", { status: 200 });
+    } catch (error) {
+        // Abort multipart upload on error
+        const abortMultipartUploadCommand = new AbortMultipartUploadCommand({
+            Bucket: BUCKET!,
+            Key: filename as string,
+            UploadId: uploadId
+        });
+        await s3.send(abortMultipartUploadCommand);
+        throw error;
+    }
+};
 
 export const onRequestPatch: PagesFunction<Env> = async (context) => {
     const { params, env, request } = context;
